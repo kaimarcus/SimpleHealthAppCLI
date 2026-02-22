@@ -9,11 +9,23 @@ Run with:
 Main menu → sub-menus:
   1. Patients      → Add, Edit, List
   2. Observations  → Add, View
-  3. Encounters    → Add (with inline multi-provider assignment), Edit, View
+  3. Encounters    → Add (with inline multi-provider assignment), Edit, View, History
   4. Providers     → Add, Edit, List
   5. FHIR          → Export Bundle, Import Patient
   6. Seed Demo Data
   0. Exit
+
+Typing 'quit' (case-insensitive) at any input prompt cancels the current
+operation and returns to the previous menu.  Typing 'quit' at the main-menu
+prompt exits the program.  A partially entered add or update is never saved
+when the user quits mid-way.
+
+Code is organised into four sections:
+  1. Reference data   — lookup tables used for menus and validation
+  2. UI helpers       — prompt(), header(), and related display utilities
+  3. CLI layer        — input-gathering functions (prompt / display only)
+  4. Action layer     — database operations (no user prompting)
+  5. Menu layer       — navigation loops that tie CLI and actions together
 """
 
 import json
@@ -34,7 +46,6 @@ from fhir_utils import (
 # Reference data — codes used when prompting the user
 # ---------------------------------------------------------------------------
 
-# LOINC codes for common vital-sign observations
 KNOWN_OBSERVATIONS = {
     "1": ("8867-4",  "Heart rate",           "/min"),
     "2": ("8310-5",  "Body temperature",     "Cel"),
@@ -44,7 +55,6 @@ KNOWN_OBSERVATIONS = {
     "6": ("8302-2",  "Body height",          "cm"),
 }
 
-# HL7 v3 ActCode values for the Encounter class
 KNOWN_ENCOUNTER_CLASSES = {
     "1": ("AMB",    "Ambulatory encounter"),
     "2": ("IMP",    "Inpatient encounter"),
@@ -52,7 +62,6 @@ KNOWN_ENCOUNTER_CLASSES = {
     "4": ("OBSENC", "Observation encounter"),
 }
 
-# FHIR Encounter.status values
 KNOWN_STATUSES = {
     "1": "planned",
     "2": "in-progress",
@@ -60,13 +69,20 @@ KNOWN_STATUSES = {
     "4": "cancelled",
 }
 
-# v3 ParticipationType codes mapped to readable labels
 KNOWN_ROLES = {
     "1": "attending",
     "2": "consultant",
     "3": "referring",
     "4": "admitting",
 }
+
+
+# ---------------------------------------------------------------------------
+# Exception
+# ---------------------------------------------------------------------------
+
+class QuitRequested(Exception):
+    """Raised when the user types 'quit' at any prompt to cancel the operation."""
 
 
 # ---------------------------------------------------------------------------
@@ -83,40 +99,112 @@ def subheader(title: str):
     print(f"\n  ── {title} ──")
 
 
-def prompt(msg: str, default: str = "") -> str:
+def prompt(msg: str, default: str = "", required: bool = True) -> str:
+    """Display a prompt and return the user's trimmed response.
+
+    Behaviour:
+    - 'quit' / 'QUIT' (any case) → raise QuitRequested.
+    - Non-blank input             → return it as-is.
+    - Blank + *default* present   → return the default.
+    - Blank + required=True       → reprompt with a hint.
+    - Blank + required=False      → return "".
+    """
     suffix = f" [{default}]" if default else ""
-    value = input(f"  {msg}{suffix}: ").strip()
-    return value if value else default
+    while True:
+        value = input(f"  {msg}{suffix}: ").strip()
+        if value.lower() == "quit":
+            raise QuitRequested()
+        if value:
+            return value
+        if default:
+            return default
+        if not required:
+            return ""
+        print("  ✗  This field is required — enter a value, or type 'quit' to cancel.")
+
+
+def prompt_until(msg: str, validator, error: str, default: str = ""):
+    """Reprompt until *validator(value)* returns something other than None.
+
+    Args:
+        msg:       Prompt text shown to the user.
+        validator: Callable(str) → value | None.  None signals invalid input;
+                   any other value is accepted and returned.
+        error:     Message printed when validation fails.
+        default:   Optional default shown in brackets; blank input uses it.
+                   When absent a blank response triggers a required-field hint.
+
+    Raises QuitRequested if the user types 'quit'.
+    """
+    while True:
+        value = prompt(msg, default, required=not bool(default))
+        result = validator(value)
+        if result is not None:
+            return result
+        print(f"  ✗  {error}")
+
+
+def _parse_float(v: str) -> "float | None":
+    """Validator for prompt_until: return float or None."""
+    try:
+        return float(v)
+    except ValueError:
+        return None
 
 
 def pause():
     input("\n  Press Enter to continue...")
 
 
-def _parse_datetime(raw: str, default: datetime | None = None) -> datetime | None:
-    """
-    Try several common datetime / date formats and return a datetime object.
-    Returns *default* if raw is empty; raises ValueError if unparseable.
+# ---------------------------------------------------------------------------
+# Data parsers / shared utilities
+# ---------------------------------------------------------------------------
+
+def _parse_iso_date(value: str) -> "date | None":
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _parse_datetime(raw: str) -> "datetime | None":
+    """Try several common date/time formats.
+
+    Returns None if *raw* is blank.
+    Raises ValueError if *raw* is non-empty but cannot be parsed.
     """
     if not raw:
-        return default
-    try:
-        return datetime.strptime(raw, "%Y-%m-%dT%H:%M")
-    except ValueError:
-        raise ValueError(f"Cannot parse '{raw}' — YYYY-MM-DDTHH:MM")
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Cannot parse '{raw}' — use YYYY-MM-DD, YYYY-MM-DD HH:MM, or YYYY-MM-DDTHH:MM"
+    )
 
 
-def _get_patient(session, pid_str: str) -> "Patient | None":
-    """Look up a Patient by ID string; print an error and return None on failure."""
+def _find_patient(session, pid_str: str) -> "Patient | None":
+    """Look up a Patient by ID string; return None on any failure (no side effects)."""
     try:
-        patient = session.get(Patient, int(pid_str))
+        return session.get(Patient, int(pid_str))
     except (ValueError, TypeError):
-        print("  ✗  Patient ID must be a number.")
         return None
-    if not patient:
-        print("  ✗  Patient not found.")
+
+
+def _find_encounter(session, enc_str: str) -> "Encounter | None":
+    try:
+        return session.get(Encounter, int(enc_str))
+    except (ValueError, TypeError):
         return None
-    return patient
+
+
+def _find_provider(session, prov_str: str) -> "Provider | None":
+    try:
+        return session.get(Provider, int(prov_str))
+    except (ValueError, TypeError):
+        return None
 
 
 def _show_db_summary(session):
@@ -126,74 +214,246 @@ def _show_db_summary(session):
     n_enc       = session.query(Encounter).count()
     n_parts     = session.query(EncounterParticipant).count()
     n_obs       = session.query(Observation).count()
-    print(f"\n  ┌─────────────────────────────────────────┐")
+    print(f"\n  ┌──────────────────────────────────────────┐")
     print(f"  │  Database state                         │")
-    print(f"  ├─────────────────────────────────────────┤")
-    print(f"  │  Patients              : {n_patients:<14} │")
-    print(f"  │  Providers             : {n_providers:<14} │")
-    print(f"  │  Encounters            : {n_enc:<14} │")
+    print(f"  ├──────────────────────────────────────────┤")
+    print(f"  │  Patients               : {n_patients:<14} │")
+    print(f"  │  Providers              : {n_providers:<14} │")
+    print(f"  │  Encounters             : {n_enc:<14} │")
     print(f"  │  Encounter participants : {n_parts:<14} │")
-    print(f"  │  Observations          : {n_obs:<14} │")
+    print(f"  │  Observations           : {n_obs:<14} │")
     print(f"  └─────────────────────────────────────────┘")
 
 
-# ---------------------------------------------------------------------------
-# Patient actions
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# CLI / Input-gathering layer
+#
+# Every function in this section interacts only with the user (prompt / print).
+# Functions may receive plain values or ORM objects for display purposes but
+# make no database writes and contain no business logic.
+# They return plain data (dicts / scalars) or raise QuitRequested.
+# ===========================================================================
 
-def patient_info_prompt_loop():
-    first  = prompt("First name")
-    last   = prompt("Last name")
+def cli_select_patient(session) -> "Patient":
+    """Prompt for a patient ID; return the matching Patient or raise QuitRequested."""
+    return prompt_until(
+        "Patient ID",
+        lambda v: _find_patient(session, v),
+        "No patient with that ID — enter a valid patient ID.",
+    )
+
+
+def cli_select_encounter(session) -> "Encounter":
+    """Prompt for an encounter ID; return the matching Encounter or raise QuitRequested."""
+    return prompt_until(
+        "Encounter ID",
+        lambda v: _find_encounter(session, v),
+        "No encounter with that ID — enter a valid encounter ID.",
+    )
+
+
+def cli_patient_fields(defaults: "dict | None" = None) -> dict:
+    """Prompt for patient demographic fields.
+
+    *defaults* may contain: first, last, birth_date (date object), gender.
+    When provided the user may press Enter to keep each current value.
+
+    Returns dict {first, last, birth_date, gender} or raises QuitRequested.
+    """
+    d = defaults or {}
+    first = prompt("First name", default=d.get("first", ""))
+    last  = prompt("Last name",  default=d.get("last",  ""))
+    birth_date = prompt_until(
+        "Date of birth (YYYY-MM-DD)",
+        _parse_iso_date,
+        "Invalid date — use YYYY-MM-DD (e.g. 1990-06-15).",
+        default=str(d["birth_date"]) if d.get("birth_date") else "",
+    )
+    gender = prompt_until(
+        "Gender (male / female / other / unknown)",
+        lambda v: v if v in ("male", "female", "other", "unknown") else None,
+        "Must be one of: male, female, other, unknown.",
+        default=d.get("gender", "unknown"),
+    )
+    return {"first": first, "last": last, "birth_date": birth_date, "gender": gender}
+
+
+def cli_observation_inputs(patient) -> dict:
+    """Display the observation-type menu and collect type and value.
+
+    *patient* is used only for display (first_name, last_name).
+
+    Returns dict {code, display, value, unit} or raises QuitRequested.
+    """
+    print(f"\n  Adding observation for {patient.first_name} {patient.last_name}")
+    print("\n  Choose observation type:")
+    for key, (code, display, unit) in KNOWN_OBSERVATIONS.items():
+        print(f"    {key}. {display} ({unit})  [LOINC {code}]")
+
+    code, display, unit = prompt_until(
+        "Choice",
+        lambda v: KNOWN_OBSERVATIONS.get(v),
+        f"Enter a number 1–{len(KNOWN_OBSERVATIONS)}.",
+    )
+    value = prompt_until(
+        f"Value ({unit})",
+        _parse_float,
+        "Value must be a number.",
+    )
+    return {"code": code, "display": display, "value": value, "unit": unit}
+
+
+def cli_encounter_fields(defaults: "dict | None" = None) -> dict:
+    """Prompt for encounter fields.
+
+    *defaults* may contain: class_key, status_key, reason,
+    start_date_str (formatted string), end_date_str.
+
+    Returns dict {class_code, class_display, status, reason, start_date,
+    end_date} or raises QuitRequested.
+    """
+    d = defaults or {}
+
+    print("\n  Encounter class:")
+    for key, (code, display) in KNOWN_ENCOUNTER_CLASSES.items():
+        print(f"    {key}.  {display}  [{code}]")
+    class_code, class_display = prompt_until(
+        "Choice",
+        lambda v: KNOWN_ENCOUNTER_CLASSES.get(v),
+        f"Enter a number 1–{len(KNOWN_ENCOUNTER_CLASSES)}.",
+        default=d.get("class_key", ""),
+    )
+
+    print("\n  Status:")
+    for key, status in KNOWN_STATUSES.items():
+        print(f"    {key}.  {status}")
+    status = prompt_until(
+        "Choice",
+        lambda v: KNOWN_STATUSES.get(v),
+        f"Enter a number 1–{len(KNOWN_STATUSES)}.",
+        default=d.get("status_key", "3"),
+    )
+
+    reason = prompt(
+        "Reason / chief complaint (optional)",
+        default=d.get("reason", ""),
+        required=False,
+    )
+
+    start_default = d.get(
+        "start_date_str",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+    )
     while True:
-        dob = prompt("Date of birth (YYYY-MM-DD)")
-        try: 
-            birth_date = date.fromisoformat(dob)
+        start_raw = prompt(
+            "Start date/time (YYYY-MM-DD or YYYY-MM-DDTHH:MM)",
+            default=start_default,
+        )
+        try:
+            start_date = _parse_datetime(start_raw) or datetime.now(timezone.utc)
             break
-        except ValueError:
-            print("Invalid date format. Try again.")
+        except ValueError as exc:
+            print(f"  ✗  {exc}")
+
     while True:
-        gender = prompt("Gender (male/female/other/unknown)", default="unknown")
-        if gender in ("male", "female", "other", "unknown"):
+        end_raw = prompt(
+            "End date/time (optional — leave blank if ongoing)",
+            default=d.get("end_date_str", ""),
+            required=False,
+        )
+        try:
+            end_date = _parse_datetime(end_raw)
             break
-        else:
-            print("Invalid gender. Try again.")
+        except ValueError as exc:
+            print(f"  ✗  {exc}")
 
-    return first, last, birth_date, gender
+    return {
+        "class_code":    class_code,
+        "class_display": class_display,
+        "status":        status,
+        "reason":        reason or None,
+        "start_date":    start_date,
+        "end_date":      end_date,
+    }
 
-def add_patient():
-    header("Add Patient")
-    first, last, birth_date, gender = patient_info_prompt_loop()
 
+def cli_provider_fields(defaults: "dict | None" = None) -> dict:
+    """Prompt for provider fields (name, specialty, NPI).
+
+    Returns dict {first, last, specialty, npi} or raises QuitRequested.
+    """
+    d = defaults or {}
+    first     = prompt("First name",         default=d.get("first",     ""))
+    last      = prompt("Last name",          default=d.get("last",      ""))
+    specialty = prompt("Specialty (optional)", default=d.get("specialty", ""), required=False)
+
+    while True:
+        npi = prompt(
+            "NPI — 10-digit National Provider Identifier (optional)",
+            default=d.get("npi", ""),
+            required=False,
+        )
+        if not npi or (npi.isdigit() and len(npi) == 10):
+            break
+        print("  ✗  NPI must be exactly 10 digits (or leave blank).")
+
+    return {
+        "first":     first,
+        "last":      last,
+        "specialty": specialty or None,
+        "npi":       npi or None,
+    }
+
+
+def cli_fhir_import() -> str:
+    """Prompt for a FHIR Patient JSON string.
+
+    Returns the string or raises QuitRequested.
+    """
+    print("  Paste a FHIR Patient JSON string (single line), then press Enter:")
+    print("  (Type 'quit' to cancel.)")
+    while True:
+        fhir_json = input("  > ").strip()
+        if fhir_json.lower() == "quit":
+            raise QuitRequested()
+        if fhir_json:
+            return fhir_json
+        print("  ✗  No input — paste the JSON or type 'quit' to cancel.")
+
+
+# ===========================================================================
+# Action layer  (DB / business-logic operations — no user prompting)
+#
+# Functions in this section perform database operations.  They accept plain
+# data values or ORM objects, carry out their operation, and print results.
+# They never call prompt() or input().
+# ===========================================================================
+
+# ── Patients ─────────────────────────────────────────────────────────────────
+
+def action_save_patient(data: dict):
     with get_session() as session:
         patient = Patient(
-            first_name=first,
-            last_name=last,
-            birth_date=birth_date,
-            gender=gender,
+            first_name=data["first"],
+            last_name=data["last"],
+            birth_date=data["birth_date"],
+            gender=data["gender"],
         )
         session.add(patient)
         session.commit()
         print(f"\n  Patient saved  (id={patient.id})")
 
 
-def edit_patient():
-    header("Edit Patient")
-    with get_session() as session:
-        pid_str = prompt("Patient ID to edit")
-        if not (patient := _get_patient(session, pid_str)):
-            return
-
-        print(f"\n  Editing: {patient.first_name} {patient.last_name}  "
-              f"(DOB: {patient.birth_date}  Gender: {patient.gender})")
-        print("  Press Enter to keep the current value.\n")
-
-        patient.first_name, patient.last_name, patient.birth_date, patient.gender = patient_info_prompt_loop()
-        session.commit()
-        print(f"\n  Patient #{patient.id} updated.")
+def action_update_patient(session, patient, data: dict):
+    patient.first_name = data["first"]
+    patient.last_name  = data["last"]
+    patient.birth_date = data["birth_date"]
+    patient.gender     = data["gender"]
+    session.commit()
+    print(f"\n  Patient #{patient.id} updated.")
 
 
-def list_patients():
-    header("Patients")
+def action_list_patients():
     with get_session() as session:
         patients = session.query(Patient).order_by(Patient.id).all()
         if not patients:
@@ -206,488 +466,175 @@ def list_patients():
             print(f"  {p.id:<5} {name:<30} {str(p.birth_date):<12} {p.gender}")
 
 
-# ---------------------------------------------------------------------------
-# Observation actions
-# ---------------------------------------------------------------------------
-
-def add_observation():
-    header("Add Observation")
-
-    with get_session() as session:
-        if not (patient := _get_patient(session, prompt("Patient ID"))):
-            return
-
-        print(f"\n  Adding observation for {patient.first_name} {patient.last_name}")
-        print("\n  Choose observation type:")
-        for key, (code, display, unit) in KNOWN_OBSERVATIONS.items():
-            print(f"    {key}. {display} ({unit})  [LOINC {code}]")
-
-        choice = prompt("Choice")
-        if choice not in KNOWN_OBSERVATIONS:
-            print("  ✗  Invalid choice.")
-            return
-
-        code, display, unit = KNOWN_OBSERVATIONS[choice]
-        value_str = prompt(f"Value ({unit})")
-
-        try:
-            value = float(value_str)
-        except ValueError:
-            print("  ✗  Value must be a number.")
-            return
-
-        obs = Observation(
-            patient_id=patient.id,
-            code=code,
-            display=display,
-            value=value,
-            unit=unit,
-            recorded_at=datetime.now(timezone.utc),
-        )
-        session.add(obs)
-        session.commit()
-        print(f"\n  Observation saved  (id={obs.id})")
-
-
-def view_observations():
-    header("View Observations")
-
-    with get_session() as session:
-        if not (patient := _get_patient(session, prompt("Patient ID"))):
-            return
-
-        obs_list = (
-            session.query(Observation)
-            .filter(Observation.patient_id == patient.id)
-            .order_by(Observation.recorded_at)
-            .all()
-        )
-
-        print(f"\n  Observations for {patient.first_name} {patient.last_name}:\n")
-        if not obs_list:
-            print("  No observations recorded yet.")
-            return
-
-        print(f"  {'ID':<5} {'Date/Time':<20} {'Measurement':<25} {'Value':<10} {'Unit'}")
-        print(f"  {'──':<5} {'─────────':<20} {'───────────':<25} {'─────':<10} {'────'}")
-        for o in obs_list:
-            ts = o.recorded_at.strftime("%Y-%m-%d %H:%M")
-            print(f"  {o.id:<5} {ts:<20} {o.display:<25} {o.value:<10} {o.unit}")
-
-
-# ---------------------------------------------------------------------------
-# Encounter actions
-# ---------------------------------------------------------------------------
-
-def _manage_encounter_providers(session, encounter):
-    """
-    Interactive sub-loop for adding / removing providers on an encounter.
-    Supports entering multiple providers with different roles.
-    Called from both add_encounter and edit_encounter.
-    """
-    while True:
-        subheader(f"Providers — Encounter #{encounter.id}")
-
-        participants = (
-            session.query(EncounterParticipant)
-            .filter_by(encounter_id=encounter.id)
-            .all()
-        )
-
-        if participants:
-            print(f"  {'Part.ID':<9} {'Role':<12} {'Provider':<28} {'Specialty'}")
-            print(f"  {'───────':<9} {'────':<12} {'────────':<28} {'─────────'}")
-            for ep in participants:
-                name = f"{ep.provider.first_name} {ep.provider.last_name}"
-                spec = ep.provider.specialty or "—"
-                print(f"  {ep.id:<9} {ep.role.capitalize():<12} {name:<28} {spec}")
-        else:
-            print("  (no providers assigned yet)")
-
-        print()
-        print("    a.  Add provider")
-        print("    r.  Remove provider")
-        print("    d.  Done (save and return)")
-        sub = prompt("Action", default="d").lower()
-
-        if sub == "d":
-            break
-
-        elif sub == "a":
-            # Show the provider list so the user can pick an ID
-            providers = session.query(Provider).order_by(Provider.id).all()
-            if not providers:
-                print("\n  ✗  No providers in the database — add providers first.")
-                continue
-
-            print()
-            print(f"  {'ID':<5} {'Name':<28} {'Specialty':<25} {'NPI'}")
-            print(f"  {'──':<5} {'────':<28} {'─────────':<25} {'───'}")
-            for pv in providers:
-                name = f"{pv.first_name} {pv.last_name}"
-                print(f"  {pv.id:<5} {name:<28} {pv.specialty or '—':<25} {pv.npi or '—'}")
-
-            prov_str = prompt("\n  Provider ID to add")
-            try:
-                provider = session.get(Provider, int(prov_str))
-            except (ValueError, TypeError):
-                print("  ✗  Provider ID must be a number.")
-                continue
-            if not provider:
-                print("  ✗  Provider not found.")
-                continue
-
-            existing = (
-                session.query(EncounterParticipant)
-                .filter_by(encounter_id=encounter.id, provider_id=provider.id)
-                .first()
-            )
-            if existing:
-                print(f"  ✗  {provider.first_name} {provider.last_name} is already "
-                      f"linked to this encounter (role: {existing.role}).")
-                continue
-
-            print("\n  Participant role:")
-            for key, role in KNOWN_ROLES.items():
-                print(f"    {key}.  {role}")
-            role_choice = prompt("  Choice", default="1")
-            role = KNOWN_ROLES.get(role_choice, "attending")
-
-            ep = EncounterParticipant(
-                encounter_id=encounter.id,
-                provider_id=provider.id,
-                role=role,
-            )
-            session.add(ep)
-            session.flush()
-            print(f"\n  Added {provider.first_name} {provider.last_name} "
-                  f"as {role}  (participant id={ep.id})")
-
-        elif sub == "r":
-            ep_str = prompt("  Participant ID to remove")
-            try:
-                ep = session.get(EncounterParticipant, int(ep_str))
-            except (ValueError, TypeError):
-                print("  ✗  Must be a number.")
-                continue
-            if not ep or ep.encounter_id != encounter.id:
-                print("  ✗  Participant not found on this encounter.")
-                continue
-            name = f"{ep.provider.first_name} {ep.provider.last_name}"
-            session.delete(ep)
-            session.flush()
-            print(f"  Removed {name} from encounter #{encounter.id}.")
-
-        else:
-            print("  ✗  Invalid choice — enter a, r, or d.")
-
-
-def add_encounter():
-    """
-    Create a new Encounter for a patient, then optionally assign
-    one or more providers with roles inline.
-    """
-    header("Add Encounter")
-
-    with get_session() as session:
-        if not (patient := _get_patient(session, prompt("Patient ID"))):
-            return
-
-        print(f"\n  Adding encounter for {patient.first_name} {patient.last_name}")
-
-        print("\n  Encounter class:")
-        for key, (code, display) in KNOWN_ENCOUNTER_CLASSES.items():
-            print(f"    {key}.  {display}  [{code}]")
-        class_choice = prompt("Choice")
-        if class_choice not in KNOWN_ENCOUNTER_CLASSES:
-            print("  ✗  Invalid choice.")
-            return
-        class_code, class_display = KNOWN_ENCOUNTER_CLASSES[class_choice]
-
-        print("\n  Status:")
-        for key, status in KNOWN_STATUSES.items():
-            print(f"    {key}.  {status}")
-        status_choice = prompt("Choice", default="3")
-        status = KNOWN_STATUSES.get(status_choice, "finished")
-
-        reason = prompt("Reason / chief complaint (optional)")
-
-        start_raw = prompt(
-            "Start date/time (YYYY-MM-DD or YYYY-MM-DD HH:MM)",
-            default=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-        )
-        try:
-            start_date = _parse_datetime(start_raw, default=datetime.now(timezone.utc))
-        except ValueError as e:
-            print(f"  ✗  {e}")
-            return
-
-        end_raw = prompt("End date/time (leave blank if ongoing)")
-        try:
-            end_date = _parse_datetime(end_raw)
-        except ValueError as e:
-            print(f"  ✗  {e}")
-            return
-
-        encounter = Encounter(
-            patient_id=patient.id,
-            class_code=class_code,
-            class_display=class_display,
-            status=status,
-            reason=reason if reason else None,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        session.add(encounter)
-        session.flush()
-        print(f"\n  Encounter created  (id={encounter.id})")
-
-        # Inline multi-provider assignment
-        if prompt("\n  Assign providers now? (y/n)", default="y").lower() == "y":
-            _manage_encounter_providers(session, encounter)
-
-        session.commit()
-        print(f"\n  Encounter #{encounter.id} saved.")
-
-
-def edit_encounter():
-    """Edit an existing Encounter and manage its provider assignments."""
-    header("Edit Encounter")
-
-    with get_session() as session:
-        enc_str = prompt("Encounter ID to edit")
-        try:
-            encounter = session.get(Encounter, int(enc_str))
-        except (ValueError, TypeError):
-            print("  ✗  Encounter ID must be a number.")
-            return
-        if not encounter:
-            print("  ✗  Encounter not found.")
-            return
-
-        patient = session.get(Patient, encounter.patient_id)
-        print(f"\n  Editing Encounter #{encounter.id}  —  {encounter.class_display}"
-              f"  ({patient.first_name} {patient.last_name})")
-        print("  Press Enter to keep the current value.\n")
-
-        change_reason = prompt("Reason for this edit (optional, stored in audit log)")
-
-        # Encounter class
-        current_class_key = next(
-            (k for k, (c, _) in KNOWN_ENCOUNTER_CLASSES.items()
-             if c == encounter.class_code), "1"
-        )
-        print("  Encounter class:")
-        for key, (code, display) in KNOWN_ENCOUNTER_CLASSES.items():
-            print(f"    {key}.  {display}  [{code}]")
-        class_choice = prompt("Choice", default=current_class_key)
-        if class_choice not in KNOWN_ENCOUNTER_CLASSES:
-            print("  ✗  Invalid choice.")
-            return
-        class_code, class_display = KNOWN_ENCOUNTER_CLASSES[class_choice]
-
-        # Status
-        current_status_key = next(
-            (k for k, s in KNOWN_STATUSES.items() if s == encounter.status), "3"
-        )
-        print("\n  Status:")
-        for key, status in KNOWN_STATUSES.items():
-            print(f"    {key}.  {status}")
-        status_choice = prompt("Choice", default=current_status_key)
-        status = KNOWN_STATUSES.get(status_choice, encounter.status)
-
-        reason = prompt("Reason / chief complaint", default=encounter.reason or "")
-
-        start_default = encounter.start_date.strftime("%Y-%m-%d %H:%M")
-        start_raw = prompt(
-            "Start date/time (YYYY-MM-DD or YYYY-MM-DD HH:MM)",
-            default=start_default,
-        )
-        try:
-            start_date = _parse_datetime(start_raw, default=encounter.start_date)
-        except ValueError as e:
-            print(f"  ✗  {e}")
-            return
-
-        end_default = encounter.end_date.strftime("%Y-%m-%d %H:%M") if encounter.end_date else ""
-        end_raw = prompt("End date/time (leave blank to clear)", default=end_default)
-        try:
-            end_date = _parse_datetime(end_raw)
-        except ValueError as e:
-            print(f"  ✗  {e}")
-            return
-
-        snapshot_encounter(session, encounter, change_reason=change_reason)
-
-        encounter.class_code    = class_code
-        encounter.class_display = class_display
-        encounter.status        = status
-        encounter.reason        = reason if reason else None
-        encounter.start_date    = start_date
-        encounter.end_date      = end_date
-        session.flush()
-
-        # Provider management
-        print("\n  Manage providers for this encounter:")
-        _manage_encounter_providers(session, encounter)
-
-        session.commit()
-        print(f"\n  Encounter #{encounter.id} updated.")
-
-
-def view_encounters():
-    """List all encounters for a patient, including linked providers."""
-    header("View Encounters")
-
-    with get_session() as session:
-        if not (patient := _get_patient(session, prompt("Patient ID"))):
-            return
-
-        encounters = (
-            session.query(Encounter)
-            .filter(Encounter.patient_id == patient.id)
-            .order_by(Encounter.start_date)
-            .all()
-        )
-
-        print(f"\n  Encounters for {patient.first_name} {patient.last_name}:\n")
-        if not encounters:
-            print("  No encounters recorded yet.")
-            return
-
-        for enc in encounters:
-            start = enc.start_date.strftime("%Y-%m-%d %H:%M")
-            end   = enc.end_date.strftime("%Y-%m-%d %H:%M") if enc.end_date else "ongoing"
-            reason_str = f"  Reason: {enc.reason}" if enc.reason else ""
-            print(f"  ID {enc.id}  |  {enc.class_display}  |  Status: {enc.status}")
-            print(f"           Start: {start}   End: {end}{reason_str}")
-            if enc.participants:
-                for p in enc.participants:
-                    name = f"{p.provider.first_name} {p.provider.last_name}"
-                    spec = f" ({p.provider.specialty})" if p.provider.specialty else ""
-                    print(f"           └─ {p.role.capitalize()}: {name}{spec} "
-                          f"[Provider #{p.provider_id}]")
-            else:
-                print("           └─ (no providers assigned)")
-            print()
-
-
-def view_encounter_history():
-    """Show the full audit trail of edits for a single encounter."""
-    header("Encounter Edit History")
-
-    with get_session() as session:
-        enc_str = prompt("Encounter ID")
-        try:
-            encounter = session.get(Encounter, int(enc_str))
-        except (ValueError, TypeError):
-            print("  ✗  Encounter ID must be a number.")
-            return
-        if not encounter:
-            print("  ✗  Encounter not found.")
-            return
-
-        history = (
-            session.query(EncounterHistory)
-            .filter(EncounterHistory.encounter_id == encounter.id)
-            .order_by(EncounterHistory.version)
-            .all()
-        )
-
-        patient = session.get(Patient, encounter.patient_id)
-        print(f"\n  Audit trail for Encounter #{encounter.id}  —  "
-              f"{encounter.class_display}  "
-              f"({patient.first_name} {patient.last_name})\n")
-
-        if not history:
-            print("  No edits recorded — this encounter has never been modified.")
-            return
-
-        print(f"  {'Ver':<5} {'Changed at':<18} {'Changed by':<20} {'Status':<14} "
-              f"{'Class':<10} {'Reason'}")
-        print("  " + "─" * 85)
-
-        for h in history:
-            changed_at  = h.changed_at.strftime("%Y-%m-%d %H:%M")
-            changed_by  = h.changed_by or "—"
-            reason      = h.reason or "—"
-            note        = f"  ↳ Note: {h.change_reason}" if h.change_reason else ""
-            print(f"  v{h.version:<4} {changed_at:<18} {changed_by:<20} "
-                  f"{h.status:<14} {h.class_code:<10} {reason}{note}")
-
-        print()
-        print("  (Current values are shown in 'View Encounters')")
-
-
-# ---------------------------------------------------------------------------
-# Provider actions
-# ---------------------------------------------------------------------------
-
-def add_provider():
-    """
-    Create a new Provider (FHIR Practitioner).
-
-    A Provider is any clinician who can participate in encounters — physician,
-    nurse practitioner, therapist, etc.  The NPI is the standard US identifier.
-    """
-    header("Add Provider")
-    first     = prompt("First name")
-    last      = prompt("Last name")
-    specialty = prompt("Specialty (optional)")
-    npi       = prompt("NPI — 10-digit National Provider Identifier (optional)")
-
-    if npi and (not npi.isdigit() or len(npi) != 10):
-        print("  ✗  NPI must be exactly 10 digits.")
+# ── Observations ─────────────────────────────────────────────────────────────
+
+def action_add_observation(session, patient_id: int, data: dict):
+    obs = Observation(
+        patient_id=patient_id,
+        code=data["code"],
+        display=data["display"],
+        value=data["value"],
+        unit=data["unit"],
+        recorded_at=datetime.now(timezone.utc),
+    )
+    session.add(obs)
+    session.commit()
+    print(f"\n  Observation saved  (id={obs.id})")
+
+
+def action_view_observations(session, patient):
+    obs_list = (
+        session.query(Observation)
+        .filter(Observation.patient_id == patient.id)
+        .order_by(Observation.recorded_at)
+        .all()
+    )
+    print(f"\n  Observations for {patient.first_name} {patient.last_name}:\n")
+    if not obs_list:
+        print("  No observations recorded yet.")
         return
+    print(f"  {'ID':<5} {'Date/Time':<20} {'Measurement':<25} {'Value':<10} {'Unit'}")
+    print(f"  {'──':<5} {'─────────':<20} {'───────────':<25} {'─────':<10} {'────'}")
+    for o in obs_list:
+        ts = o.recorded_at.strftime("%Y-%m-%d %H:%M")
+        print(f"  {o.id:<5} {ts:<20} {o.display:<25} {o.value:<10} {o.unit}")
 
+
+# ── Encounters ───────────────────────────────────────────────────────────────
+
+def action_create_encounter(session, patient_id: int, fields: dict) -> "Encounter":
+    """Create and flush a new Encounter (not yet committed).  Returns the object."""
+    encounter = Encounter(
+        patient_id=patient_id,
+        class_code=fields["class_code"],
+        class_display=fields["class_display"],
+        status=fields["status"],
+        reason=fields["reason"],
+        start_date=fields["start_date"],
+        end_date=fields["end_date"],
+    )
+    session.add(encounter)
+    session.flush()
+    print(f"\n  Encounter created  (id={encounter.id})")
+    return encounter
+
+
+def action_update_encounter(session, encounter, fields: dict, change_reason: str):
+    """Snapshot the current state, apply *fields*, and flush (not yet committed)."""
+    snapshot_encounter(session, encounter, change_reason=change_reason or None)
+    encounter.class_code    = fields["class_code"]
+    encounter.class_display = fields["class_display"]
+    encounter.status        = fields["status"]
+    encounter.reason        = fields["reason"]
+    encounter.start_date    = fields["start_date"]
+    encounter.end_date      = fields["end_date"]
+    session.flush()
+
+
+def action_view_encounters(session, patient):
+    encounters = (
+        session.query(Encounter)
+        .filter(Encounter.patient_id == patient.id)
+        .order_by(Encounter.start_date)
+        .all()
+    )
+    print(f"\n  Encounters for {patient.first_name} {patient.last_name}:\n")
+    if not encounters:
+        print("  No encounters recorded yet.")
+        return
+    for enc in encounters:
+        start = enc.start_date.strftime("%Y-%m-%d %H:%M")
+        end   = enc.end_date.strftime("%Y-%m-%d %H:%M") if enc.end_date else "ongoing"
+        reason_str = f"  Reason: {enc.reason}" if enc.reason else ""
+        print(f"  ID {enc.id}  |  {enc.class_display}  |  Status: {enc.status}")
+        print(f"           Start: {start}   End: {end}{reason_str}")
+        if enc.participants:
+            for p in enc.participants:
+                name = f"{p.provider.first_name} {p.provider.last_name}"
+                spec = f" ({p.provider.specialty})" if p.provider.specialty else ""
+                print(f"           └─ {p.role.capitalize()}: {name}{spec} "
+                      f"[Provider #{p.provider_id}]")
+        else:
+            print("           └─ (no providers assigned)")
+        print()
+
+
+def action_view_encounter_history(session, encounter):
+    history = (
+        session.query(EncounterHistory)
+        .filter(EncounterHistory.encounter_id == encounter.id)
+        .order_by(EncounterHistory.version)
+        .all()
+    )
+    patient = session.get(Patient, encounter.patient_id)
+    print(f"\n  Audit trail for Encounter #{encounter.id}  —  "
+          f"{encounter.class_display}  "
+          f"({patient.first_name} {patient.last_name})\n")
+    if not history:
+        print("  No edits recorded — this encounter has never been modified.")
+        return
+    print(f"  {'Ver':<5} {'Changed at':<18} {'Changed by':<20} {'Status':<14} "
+          f"{'Class':<10} {'Reason'}")
+    print("  " + "─" * 85)
+    for h in history:
+        changed_at = h.changed_at.strftime("%Y-%m-%d %H:%M")
+        changed_by = h.changed_by or "—"
+        reason     = h.reason or "—"
+        note       = f"  ↳ Note: {h.change_reason}" if h.change_reason else ""
+        print(f"  v{h.version:<4} {changed_at:<18} {changed_by:<20} "
+              f"{h.status:<14} {h.class_code:<10} {reason}{note}")
+    print()
+    print("  (Current values are shown in 'View Encounters')")
+
+
+# ── Encounter participants ────────────────────────────────────────────────────
+
+def action_add_participant(session, encounter_id: int, provider_id: int, role: str):
+    ep = EncounterParticipant(
+        encounter_id=encounter_id,
+        provider_id=provider_id,
+        role=role,
+    )
+    session.add(ep)
+    session.flush()
+    provider = session.get(Provider, provider_id)
+    print(f"\n  Added {provider.first_name} {provider.last_name} "
+          f"as {role}  (participant id={ep.id})")
+
+
+def action_remove_participant(session, ep):
+    name         = f"{ep.provider.first_name} {ep.provider.last_name}"
+    encounter_id = ep.encounter_id
+    session.delete(ep)
+    session.flush()
+    print(f"  Removed {name} from encounter #{encounter_id}.")
+
+
+# ── Providers ─────────────────────────────────────────────────────────────────
+
+def action_save_provider(data: dict):
     with get_session() as session:
         provider = Provider(
-            first_name=first,
-            last_name=last,
-            specialty=specialty if specialty else None,
-            npi=npi if npi else None,
+            first_name=data["first"],
+            last_name=data["last"],
+            specialty=data["specialty"],
+            npi=data["npi"],
         )
         session.add(provider)
         session.commit()
         print(f"\n  Provider saved  (id={provider.id})")
 
 
-def edit_provider():
-    header("Edit Provider")
-    with get_session() as session:
-        pid_str = prompt("Provider ID to edit")
-        try:
-            provider = session.get(Provider, int(pid_str))
-        except (ValueError, TypeError):
-            print("  ✗  Provider ID must be a number.")
-            return
-        if not provider:
-            print("  ✗  Provider not found.")
-            return
-
-        print(f"\n  Editing: {provider.first_name} {provider.last_name}  "
-              f"Specialty: {provider.specialty or '—'}  NPI: {provider.npi or '—'}")
-        print("  Press Enter to keep the current value.\n")
-
-        first     = prompt("First name", default=provider.first_name)
-        last      = prompt("Last name",  default=provider.last_name)
-        specialty = prompt("Specialty",  default=provider.specialty or "")
-        npi       = prompt("NPI",        default=provider.npi or "")
-
-        if npi and (not npi.isdigit() or len(npi) != 10):
-            print("  ✗  NPI must be exactly 10 digits.")
-            return
-
-        provider.first_name = first
-        provider.last_name  = last
-        provider.specialty  = specialty if specialty else None
-        provider.npi        = npi if npi else None
-        session.commit()
-        print(f"\n  Provider #{provider.id} updated.")
+def action_update_provider(session, provider, data: dict):
+    provider.first_name = data["first"]
+    provider.last_name  = data["last"]
+    provider.specialty  = data["specialty"]
+    provider.npi        = data["npi"]
+    session.commit()
+    print(f"\n  Provider #{provider.id} updated.")
 
 
-def list_providers():
-    header("Providers")
+def action_list_providers():
     with get_session() as session:
         providers = session.query(Provider).order_by(Provider.id).all()
         if not providers:
@@ -697,62 +644,43 @@ def list_providers():
         print(f"  {'──':<5} {'────':<28} {'─────────':<25} {'───'}")
         for pv in providers:
             name = f"{pv.first_name} {pv.last_name}"
-            spec = pv.specialty or "—"
-            npi  = pv.npi or "—"
-            print(f"  {pv.id:<5} {name:<28} {spec:<25} {npi}")
+            print(f"  {pv.id:<5} {name:<28} {pv.specialty or '—':<25} {pv.npi or '—'}")
 
 
-# ---------------------------------------------------------------------------
-# FHIR export / import
-# ---------------------------------------------------------------------------
+# ── FHIR ─────────────────────────────────────────────────────────────────────
 
-def export_fhir_bundle():
-    """
-    Export a FHIR Bundle for one patient, including all linked resources:
-    Patient → Observations → Encounters → Practitioners (Providers).
-    """
-    header("Export FHIR Bundle")
+def action_export_fhir_bundle(session, patient):
+    """Build and write a FHIR Bundle for *patient* to a JSON file."""
+    _ = patient.observations
+    for enc in patient.encounters:
+        for p in enc.participants:
+            _ = p.provider
 
-    with get_session() as session:
-        if not (patient := _get_patient(session, prompt("Patient ID"))):
-            return
+    bundle = build_patient_bundle(patient)
+    output = bundle_to_json(bundle)
 
-        # Eagerly load all relationships before the session closes
-        _ = patient.observations
-        for enc in patient.encounters:
-            for p in enc.participants:
-                _ = p.provider
+    filename = f"patient_{patient.id}_bundle.json"
+    with open(filename, "w") as f:
+        f.write(output)
 
-        bundle = build_patient_bundle(patient)
-        output = bundle_to_json(bundle)
+    resource_counts = {}
+    for entry in bundle["entry"]:
+        rt = entry["resource"]["resourceType"]
+        resource_counts[rt] = resource_counts.get(rt, 0) + 1
 
-        filename = f"patient_{patient.id}_bundle.json"
-        with open(filename, "w") as f:
-            f.write(output)
-
-        resource_counts = {}
-        for entry in bundle["entry"]:
-            rt = entry["resource"]["resourceType"]
-            resource_counts[rt] = resource_counts.get(rt, 0) + 1
-
-        print(f"\n  FHIR Bundle written to: {filename}")
-        print(f"  Resources included:")
-        for rt, count in resource_counts.items():
-            print(f"    {count}× {rt}")
-        print(f"\n  Preview (first 40 lines):\n")
-        for i, line in enumerate(output.splitlines()):
-            if i >= 40:
-                print("  ... (truncated — open the file to see the rest)")
-                break
-            print(f"  {line}")
+    print(f"\n  FHIR Bundle written to: {filename}")
+    print(f"  Resources included:")
+    for rt, count in resource_counts.items():
+        print(f"    {count}× {rt}")
+    print(f"\n  Preview (first 40 lines):\n")
+    for i, line in enumerate(output.splitlines()):
+        if i >= 40:
+            print("  ... (truncated — open the file to see the rest)")
+            break
+        print(f"  {line}")
 
 
-def import_fhir_patient():
-    header("Import FHIR Patient")
-
-    print("  Paste a FHIR Patient JSON string (single line), then press Enter:")
-    fhir_json = input("  > ").strip()
-
+def action_import_fhir_patient(fhir_json: str):
     try:
         data = fhir_patient_to_dict(fhir_json)
     except Exception as e:
@@ -777,18 +705,10 @@ def import_fhir_patient():
         print(f"\n  Patient imported and saved  (id={patient.id})")
 
 
-# ---------------------------------------------------------------------------
-# Demo seed data
-# ---------------------------------------------------------------------------
+# ── Seed demo data ────────────────────────────────────────────────────────────
 
-def seed_demo_data():
-    """
-    Populate the database with two patients, providers, observations, and
-    encounters (with participant assignments).  If data already exists the
-    seed is skipped, but the current DB state is always printed.
-    """
-    header("Seed Demo Data")
-
+def action_seed_demo_data():
+    """Populate the database with demo patients, providers, observations, and encounters."""
     with get_session() as session:
         existing = session.query(Patient).count()
         if existing > 0:
@@ -796,7 +716,6 @@ def seed_demo_data():
             _show_db_summary(session)
             return
 
-        # ── Patients ──────────────────────────────────────────────────────────
         alice = Patient(
             first_name="Alice", last_name="Walker",
             birth_date=date(1985, 6, 20), gender="female",
@@ -808,7 +727,6 @@ def seed_demo_data():
         session.add_all([alice, bob])
         session.flush()
 
-        # ── Observations ──────────────────────────────────────────────────────
         session.add_all([
             Observation(patient_id=alice.id, code="8867-4",
                         display="Heart rate",       value=72.0,  unit="/min",
@@ -833,7 +751,6 @@ def seed_demo_data():
                         recorded_at=datetime(2025, 2, 5, 14, 32)),
         ])
 
-        # ── Providers ─────────────────────────────────────────────────────────
         dr_chen = Provider(
             first_name="Linda",  last_name="Chen",
             specialty="Internal Medicine", npi="1234567890",
@@ -845,7 +762,6 @@ def seed_demo_data():
         session.add_all([dr_chen, dr_patel])
         session.flush()
 
-        # ── Encounters ────────────────────────────────────────────────────────
         enc1 = Encounter(
             patient_id=alice.id, class_code="AMB",
             class_display="Ambulatory encounter", status="finished",
@@ -870,7 +786,6 @@ def seed_demo_data():
         session.add_all([enc1, enc2, enc3])
         session.flush()
 
-        # ── Encounter Participants ────────────────────────────────────────────
         session.add_all([
             EncounterParticipant(encounter_id=enc1.id,
                                  provider_id=dr_chen.id,  role="attending"),
@@ -903,14 +818,321 @@ def seed_demo_data():
         print("\n  Observations: 4 for Alice, 3 for Bob")
 
 
-# ---------------------------------------------------------------------------
-# Sub-menus
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Menu / Navigation layer
+#
+# This section contains all control-flow and user-navigation logic.
+#
+# _manage_encounter_providers — interactive provider sub-loop for encounters.
+# do_*  — thin orchestrators: call CLI functions for input, action functions
+#         to persist, and catch QuitRequested so cancellation is clean.
+# menu_* / _submenu / main — navigation loops.
+# ===========================================================================
+
+# ── Encounter provider sub-loop ───────────────────────────────────────────────
+
+def _manage_encounter_providers(session, encounter):
+    """Interactive sub-loop for adding / removing providers on an encounter.
+
+    QuitRequested propagates to the caller, which rolls back the session and
+    prints a cancellation message — nothing is saved.
+    """
+    while True:
+        subheader(f"Providers — Encounter #{encounter.id}")
+
+        participants = (
+            session.query(EncounterParticipant)
+            .filter_by(encounter_id=encounter.id)
+            .all()
+        )
+        if participants:
+            print(f"  {'Part.ID':<9} {'Role':<12} {'Provider':<28} {'Specialty'}")
+            print(f"  {'───────':<9} {'────':<12} {'────────':<28} {'─────────'}")
+            for ep in participants:
+                name = f"{ep.provider.first_name} {ep.provider.last_name}"
+                spec = ep.provider.specialty or "—"
+                print(f"  {ep.id:<9} {ep.role.capitalize():<12} {name:<28} {spec}")
+        else:
+            print("  (no providers assigned yet)")
+
+        print()
+        print("    a.  Add provider")
+        print("    r.  Remove provider")
+        print("    d.  Done (save and return)")
+        sub = prompt("Action", default="d").lower()
+
+        if sub == "d":
+            break
+
+        elif sub == "a":
+            providers = session.query(Provider).order_by(Provider.id).all()
+            if not providers:
+                print("\n  ✗  No providers in the database — add providers first.")
+                continue
+
+            print()
+            print(f"  {'ID':<5} {'Name':<28} {'Specialty':<25} {'NPI'}")
+            print(f"  {'──':<5} {'────':<28} {'─────────':<25} {'───'}")
+            for pv in providers:
+                name = f"{pv.first_name} {pv.last_name}"
+                print(f"  {pv.id:<5} {name:<28} {pv.specialty or '—':<25} {pv.npi or '—'}")
+
+            provider = prompt_until(
+                "Provider ID to add",
+                lambda v: _find_provider(session, v),
+                "No provider with that ID.",
+            )
+
+            existing = (
+                session.query(EncounterParticipant)
+                .filter_by(encounter_id=encounter.id, provider_id=provider.id)
+                .first()
+            )
+            if existing:
+                print(f"  ✗  {provider.first_name} {provider.last_name} is already "
+                      f"linked to this encounter (role: {existing.role}).")
+                continue
+
+            print("\n  Participant role:")
+            for key, role_name in KNOWN_ROLES.items():
+                print(f"    {key}.  {role_name}")
+            role = prompt_until(
+                "Choice",
+                lambda v: KNOWN_ROLES.get(v),
+                "Enter a number 1–4.",
+                default="1",
+            )
+            action_add_participant(session, encounter.id, provider.id, role)
+
+        elif sub == "r":
+            ep_str = prompt("Participant ID to remove")
+            try:
+                ep_id = int(ep_str)
+            except ValueError:
+                print("  ✗  Must be a number.")
+                continue
+            ep = session.get(EncounterParticipant, ep_id)
+            if not ep or ep.encounter_id != encounter.id:
+                print("  ✗  Participant not found on this encounter.")
+                continue
+            action_remove_participant(session, ep)
+
+        else:
+            print("  ✗  Enter a, r, or d.")
+
+
+# ── Patient operations ────────────────────────────────────────────────────────
+
+def do_add_patient():
+    header("Add Patient")
+    try:
+        data = cli_patient_fields()
+        action_save_patient(data)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+def do_edit_patient():
+    header("Edit Patient")
+    try:
+        with get_session() as session:
+            patient = cli_select_patient(session)
+            print(f"\n  Editing: {patient.first_name} {patient.last_name}  "
+                  f"(DOB: {patient.birth_date}  Gender: {patient.gender})")
+            print("  Press Enter to keep the current value.\n")
+            data = cli_patient_fields(defaults={
+                "first":      patient.first_name,
+                "last":       patient.last_name,
+                "birth_date": patient.birth_date,
+                "gender":     patient.gender,
+            })
+            action_update_patient(session, patient, data)
+    except QuitRequested:
+        print("  Cancelled — no changes saved.")
+
+
+def do_list_patients():
+    header("Patients")
+    action_list_patients()
+
+
+# ── Observation operations ────────────────────────────────────────────────────
+
+def do_add_observation():
+    header("Add Observation")
+    try:
+        with get_session() as session:
+            patient = cli_select_patient(session)
+            data = cli_observation_inputs(patient)
+            action_add_observation(session, patient.id, data)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+def do_view_observations():
+    header("View Observations")
+    try:
+        with get_session() as session:
+            patient = cli_select_patient(session)
+            action_view_observations(session, patient)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+# ── Encounter operations ──────────────────────────────────────────────────────
+
+def do_add_encounter():
+    header("Add Encounter")
+    try:
+        with get_session() as session:
+            patient = cli_select_patient(session)
+            print(f"\n  Adding encounter for {patient.first_name} {patient.last_name}")
+            fields = cli_encounter_fields()
+            encounter = action_create_encounter(session, patient.id, fields)
+            if prompt("\n  Assign providers now? (y/n)", default="y").lower() == "y":
+                _manage_encounter_providers(session, encounter)
+            session.commit()
+            print(f"\n  Encounter #{encounter.id} saved.")
+    except QuitRequested:
+        print("  Cancelled — encounter not saved.")
+
+
+def do_edit_encounter():
+    header("Edit Encounter")
+    try:
+        with get_session() as session:
+            encounter = cli_select_encounter(session)
+            patient = session.get(Patient, encounter.patient_id)
+            print(f"\n  Editing Encounter #{encounter.id}  —  {encounter.class_display}"
+                  f"  ({patient.first_name} {patient.last_name})")
+            print("  Press Enter to keep the current value.\n")
+
+            change_reason = prompt(
+                "Reason for this edit (optional, stored in audit log)",
+                required=False,
+            )
+
+            defaults = {
+                "class_key": next(
+                    (k for k, (c, _) in KNOWN_ENCOUNTER_CLASSES.items()
+                     if c == encounter.class_code), "1"
+                ),
+                "status_key": next(
+                    (k for k, s in KNOWN_STATUSES.items() if s == encounter.status), "3"
+                ),
+                "reason":         encounter.reason or "",
+                "start_date_str": encounter.start_date.strftime("%Y-%m-%d %H:%M"),
+                "end_date_str": (
+                    encounter.end_date.strftime("%Y-%m-%d %H:%M")
+                    if encounter.end_date else ""
+                ),
+            }
+            fields = cli_encounter_fields(defaults=defaults)
+            action_update_encounter(session, encounter, fields, change_reason)
+
+            print("\n  Manage providers for this encounter:")
+            _manage_encounter_providers(session, encounter)
+
+            session.commit()
+            print(f"\n  Encounter #{encounter.id} updated.")
+    except QuitRequested:
+        print("  Cancelled — no changes saved.")
+
+
+def do_view_encounters():
+    header("View Encounters")
+    try:
+        with get_session() as session:
+            patient = cli_select_patient(session)
+            action_view_encounters(session, patient)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+def do_view_encounter_history():
+    header("Encounter Edit History")
+    try:
+        with get_session() as session:
+            encounter = cli_select_encounter(session)
+            action_view_encounter_history(session, encounter)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+# ── Provider operations ───────────────────────────────────────────────────────
+
+def do_add_provider():
+    header("Add Provider")
+    try:
+        data = cli_provider_fields()
+        action_save_provider(data)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+def do_edit_provider():
+    header("Edit Provider")
+    try:
+        with get_session() as session:
+            provider = prompt_until(
+                "Provider ID to edit",
+                lambda v: _find_provider(session, v),
+                "No provider with that ID.",
+            )
+            print(f"\n  Editing: {provider.first_name} {provider.last_name}  "
+                  f"Specialty: {provider.specialty or '—'}  NPI: {provider.npi or '—'}")
+            print("  Press Enter to keep the current value.\n")
+            data = cli_provider_fields(defaults={
+                "first":     provider.first_name,
+                "last":      provider.last_name,
+                "specialty": provider.specialty or "",
+                "npi":       provider.npi or "",
+            })
+            action_update_provider(session, provider, data)
+    except QuitRequested:
+        print("  Cancelled — no changes saved.")
+
+
+def do_list_providers():
+    header("Providers")
+    action_list_providers()
+
+
+# ── FHIR operations ───────────────────────────────────────────────────────────
+
+def do_export_fhir_bundle():
+    header("Export FHIR Bundle")
+    try:
+        with get_session() as session:
+            patient = cli_select_patient(session)
+            action_export_fhir_bundle(session, patient)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+def do_import_fhir_patient():
+    header("Import FHIR Patient")
+    try:
+        fhir_json = cli_fhir_import()
+        action_import_fhir_patient(fhir_json)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+# ── Seed demo data ────────────────────────────────────────────────────────────
+
+def do_seed_demo_data():
+    header("Seed Demo Data")
+    action_seed_demo_data()
+
+
+# ── Sub-menus ─────────────────────────────────────────────────────────────────
 
 def _submenu(title: str, options: dict):
-    """
-    Generic sub-menu loop.
-    options: ordered dict mapping key str → (label str, callable).
+    """Generic sub-menu loop.
+
+    *options*: ordered dict mapping key str → (label str, callable).
+    Typing '0' or 'quit' at the menu choice returns to the previous menu.
     """
     while True:
         print(f"\n  ┌──────────────────────────────────────────────┐")
@@ -924,11 +1146,13 @@ def _submenu(title: str, options: dict):
 
         choice = input("\n  Choice: ").strip()
 
-        if choice == "0":
+        if choice == "0" or choice.lower() == "quit":
             break
         elif choice in options:
             try:
                 options[choice][1]()
+            except QuitRequested:
+                print("  Cancelled.")
             except Exception as e:
                 print(f"\n  ✗  Unexpected error: {e}")
             pause()
@@ -938,46 +1162,44 @@ def _submenu(title: str, options: dict):
 
 def menu_patients():
     _submenu("Patients", {
-        "1": ("Add patient",   add_patient),
-        "2": ("Edit patient",  edit_patient),
-        "3": ("List patients", list_patients),
+        "1": ("Add patient",   do_add_patient),
+        "2": ("Edit patient",  do_edit_patient),
+        "3": ("List patients", do_list_patients),
     })
 
 
 def menu_observations():
     _submenu("Observations", {
-        "1": ("Add observation",   add_observation),
-        "2": ("View observations", view_observations),
+        "1": ("Add observation",   do_add_observation),
+        "2": ("View observations", do_view_observations),
     })
 
 
 def menu_encounters():
     _submenu("Encounters", {
-        "1": ("Add encounter",         add_encounter),
-        "2": ("Edit encounter",        edit_encounter),
-        "3": ("View encounters",       view_encounters),
-        "4": ("View edit history",     view_encounter_history),
+        "1": ("Add encounter",     do_add_encounter),
+        "2": ("Edit encounter",    do_edit_encounter),
+        "3": ("View encounters",   do_view_encounters),
+        "4": ("View edit history", do_view_encounter_history),
     })
 
 
 def menu_providers():
     _submenu("Providers", {
-        "1": ("Add provider",   add_provider),
-        "2": ("Edit provider",  edit_provider),
-        "3": ("List providers", list_providers),
+        "1": ("Add provider",   do_add_provider),
+        "2": ("Edit provider",  do_edit_provider),
+        "3": ("List providers", do_list_providers),
     })
 
 
 def menu_fhir():
     _submenu("FHIR", {
-        "1": ("Export FHIR Bundle (JSON)",   export_fhir_bundle),
-        "2": ("Import FHIR Patient (JSON)",  import_fhir_patient),
+        "1": ("Export FHIR Bundle (JSON)",  do_export_fhir_bundle),
+        "2": ("Import FHIR Patient (JSON)", do_import_fhir_patient),
     })
 
 
-# ---------------------------------------------------------------------------
-# Main menu
-# ---------------------------------------------------------------------------
+# ── Main menu ─────────────────────────────────────────────────────────────────
 
 MAIN_MENU = """
   ┌──────────────────────────────────────────────┐
@@ -999,7 +1221,7 @@ MAIN_ACTIONS = {
     "3": menu_encounters,
     "4": menu_providers,
     "5": menu_fhir,
-    "6": seed_demo_data,
+    "6": do_seed_demo_data,
 }
 
 
@@ -1011,7 +1233,7 @@ def main():
         print(MAIN_MENU)
         choice = input("\n  Choice: ").strip()
 
-        if choice == "0":
+        if choice == "0" or choice.lower() == "quit":
             print("\n  Bye!\n")
             break
         elif choice in MAIN_ACTIONS:
@@ -1019,8 +1241,6 @@ def main():
                 MAIN_ACTIONS[choice]()
             except Exception as e:
                 print(f"\n  ✗  Unexpected error: {e}")
-            # Seed demo data already prints its own output; still pause for
-            # sub-menu entries to let the user read before returning
             if choice == "6":
                 pause()
         else:
