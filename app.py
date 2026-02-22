@@ -106,6 +106,19 @@ def _parse_datetime(raw: str, default: datetime | None = None) -> datetime | Non
         raise ValueError(f"Cannot parse '{raw}' — YYYY-MM-DDTHH:MM")
 
 
+def _get_patient(session, pid_str: str) -> "Patient | None":
+    """Look up a Patient by ID string; print an error and return None on failure."""
+    try:
+        patient = session.get(Patient, int(pid_str))
+    except (ValueError, TypeError):
+        print("  ✗  Patient ID must be a number.")
+        return None
+    if not patient:
+        print("  ✗  Patient not found.")
+        return None
+    return patient
+
+
 def _show_db_summary(session):
     """Print a concise summary of current database row counts."""
     n_patients  = session.query(Patient).count()
@@ -128,22 +141,28 @@ def _show_db_summary(session):
 # Patient actions
 # ---------------------------------------------------------------------------
 
-def add_patient():
-    header("Add Patient")
+def patient_info_prompt_loop():
     first  = prompt("First name")
     last   = prompt("Last name")
-    dob    = prompt("Date of birth (YYYY-MM-DD)")
-    gender = prompt("Gender (male/female/other/unknown)", default="unknown")
+    while True:
+        dob = prompt("Date of birth (YYYY-MM-DD)")
+        try: 
+            birth_date = date.fromisoformat(dob)
+            break
+        except ValueError:
+            print("Invalid date format. Try again.")
+    while True:
+        gender = prompt("Gender (male/female/other/unknown)", default="unknown")
+        if gender in ("male", "female", "other", "unknown"):
+            break
+        else:
+            print("Invalid gender. Try again.")
 
-    try:
-        birth_date = date.fromisoformat(dob)
-    except ValueError:
-        print("  ✗  Invalid date format.")
-        return
+    return first, last, birth_date, gender
 
-    if gender not in ("male", "female", "other", "unknown"):
-        print("  ✗  Gender must be one of: male, female, other, unknown")
-        return
+def add_patient():
+    header("Add Patient")
+    first, last, birth_date, gender = patient_info_prompt_loop()
 
     with get_session() as session:
         patient = Patient(
@@ -161,38 +180,14 @@ def edit_patient():
     header("Edit Patient")
     with get_session() as session:
         pid_str = prompt("Patient ID to edit")
-        try:
-            patient = session.get(Patient, int(pid_str))
-        except (ValueError, TypeError):
-            print("  ✗  Patient ID must be a number.")
-            return
-        if not patient:
-            print("  ✗  Patient not found.")
+        if not (patient := _get_patient(session, pid_str)):
             return
 
         print(f"\n  Editing: {patient.first_name} {patient.last_name}  "
               f"(DOB: {patient.birth_date}  Gender: {patient.gender})")
         print("  Press Enter to keep the current value.\n")
 
-        first  = prompt("First name", default=patient.first_name)
-        last   = prompt("Last name",  default=patient.last_name)
-        dob    = prompt("Date of birth (YYYY-MM-DD)", default=str(patient.birth_date))
-        gender = prompt("Gender (male/female/other/unknown)", default=patient.gender)
-
-        try:
-            birth_date = date.fromisoformat(dob)
-        except ValueError:
-            print("  ✗  Invalid date format.")
-            return
-
-        if gender not in ("male", "female", "other", "unknown"):
-            print("  ✗  Gender must be one of: male, female, other, unknown")
-            return
-
-        patient.first_name = first
-        patient.last_name  = last
-        patient.birth_date = birth_date
-        patient.gender     = gender
+        patient.first_name, patient.last_name, patient.birth_date, patient.gender = patient_info_prompt_loop()
         session.commit()
         print(f"\n  Patient #{patient.id} updated.")
 
@@ -202,7 +197,7 @@ def list_patients():
     with get_session() as session:
         patients = session.query(Patient).order_by(Patient.id).all()
         if not patients:
-            print("  No patients found. Use 'Seed Demo Data' to populate the database.")
+            print("  No patients found.")
             return
         print(f"  {'ID':<5} {'Name':<30} {'DOB':<12} {'Gender'}")
         print(f"  {'──':<5} {'────':<30} {'───':<12} {'──────'}")
@@ -219,14 +214,7 @@ def add_observation():
     header("Add Observation")
 
     with get_session() as session:
-        pid_str = prompt("Patient ID")
-        try:
-            patient = session.get(Patient, int(pid_str))
-        except (ValueError, TypeError):
-            print("  ✗  Patient ID must be a number.")
-            return
-        if not patient:
-            print("  ✗  Patient not found.")
+        if not (patient := _get_patient(session, prompt("Patient ID"))):
             return
 
         print(f"\n  Adding observation for {patient.first_name} {patient.last_name}")
@@ -265,14 +253,7 @@ def view_observations():
     header("View Observations")
 
     with get_session() as session:
-        pid_str = prompt("Patient ID")
-        try:
-            patient = session.get(Patient, int(pid_str))
-        except (ValueError, TypeError):
-            print("  ✗  Patient ID must be a number.")
-            return
-        if not patient:
-            print("  ✗  Patient not found.")
+        if not (patient := _get_patient(session, prompt("Patient ID"))):
             return
 
         obs_list = (
@@ -409,14 +390,7 @@ def add_encounter():
     header("Add Encounter")
 
     with get_session() as session:
-        pid_str = prompt("Patient ID")
-        try:
-            patient = session.get(Patient, int(pid_str))
-        except (ValueError, TypeError):
-            print("  ✗  Patient ID must be a number.")
-            return
-        if not patient:
-            print("  ✗  Patient not found.")
+        if not (patient := _get_patient(session, prompt("Patient ID"))):
             return
 
         print(f"\n  Adding encounter for {patient.first_name} {patient.last_name}")
@@ -566,14 +540,7 @@ def view_encounters():
     header("View Encounters")
 
     with get_session() as session:
-        pid_str = prompt("Patient ID")
-        try:
-            patient = session.get(Patient, int(pid_str))
-        except (ValueError, TypeError):
-            print("  ✗  Patient ID must be a number.")
-            return
-        if not patient:
-            print("  ✗  Patient not found.")
+        if not (patient := _get_patient(session, prompt("Patient ID"))):
             return
 
         encounters = (
@@ -747,14 +714,7 @@ def export_fhir_bundle():
     header("Export FHIR Bundle")
 
     with get_session() as session:
-        pid_str = prompt("Patient ID")
-        try:
-            patient = session.get(Patient, int(pid_str))
-        except (ValueError, TypeError):
-            print("  ✗  Patient ID must be a number.")
-            return
-        if not patient:
-            print("  ✗  Patient not found.")
+        if not (patient := _get_patient(session, prompt("Patient ID"))):
             return
 
         # Eagerly load all relationships before the session closes
