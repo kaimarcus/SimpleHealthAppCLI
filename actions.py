@@ -13,6 +13,7 @@ Sections:
   - Encounter participants
   - Providers
   - FHIR
+  - Notices of Admission (NOA)
   - Seed demo data
 """
 
@@ -21,8 +22,11 @@ from datetime import date, datetime, timezone
 from database import (
     get_session,
     Patient, Observation, Encounter, EncounterParticipant, Provider,
+    NoaRule, NoticeOfAdmission,
 )
-from fhir_utils import build_patient_bundle, bundle_to_json, fhir_patient_to_dict
+from fhir_utils import (
+    build_patient_bundle, bundle_to_json, fhir_patient_to_dict, noa_to_fhir,
+)
 from ui import _show_db_summary
 
 
@@ -314,6 +318,148 @@ def action_import_fhir_patient(fhir_json: str):
         session.add(patient)
         session.commit()
         print(f"\n  Patient imported and saved  (id={patient.id})")
+
+
+# ---------------------------------------------------------------------------
+# Notices of Admission (NOA)
+# ---------------------------------------------------------------------------
+
+def action_check_and_create_noa(encounter) -> bool:
+    """
+    Evaluate all NOA rules against *encounter* and create a NoticeOfAdmission
+    if any rule matches.  Opens its own session so it can be called after the
+    encounter's session is already committed and closed.
+
+    Matching logic:
+      - Within a rule: every non-null field must match (AND).
+      - Across rules: the first matching rule triggers the notice (OR).
+      - Duplicate guard: if a notice already exists for this encounter it is
+        skipped silently.
+
+    Returns True if a notice was created, False otherwise.
+    """
+    with get_session() as session:
+        rules = session.query(NoaRule).order_by(NoaRule.id).all()
+        matching_rule = None
+        for rule in rules:
+            code_match   = (rule.class_code is None) or (rule.class_code == encounter.class_code)
+            status_match = (rule.status is None)      or (rule.status     == encounter.status)
+            if code_match and status_match:
+                matching_rule = rule
+                break
+
+        if not matching_rule:
+            return False
+
+        existing = (
+            session.query(NoticeOfAdmission)
+            .filter_by(encounter_id=encounter.id)
+            .first()
+        )
+        if existing:
+            return False
+
+        parts = []
+        if matching_rule.class_code:
+            parts.append(f"class={matching_rule.class_code}")
+        if matching_rule.status:
+            parts.append(f"status={matching_rule.status}")
+        triggered_by = ", ".join(parts) if parts else "any encounter"
+
+        notice = NoticeOfAdmission(
+            encounter_id=encounter.id,
+            patient_id=encounter.patient_id,
+            triggered_by=triggered_by,
+        )
+        session.add(notice)
+        session.commit()
+        print(f"\n  ✓  Notice of Admission generated  (id={notice.id})")
+        return True
+
+
+def action_list_notices(patient_id: "int | None" = None):
+    """Print all notices, optionally filtered to a single patient."""
+    with get_session() as session:
+        query = session.query(NoticeOfAdmission)
+        if patient_id is not None:
+            query = query.filter_by(patient_id=patient_id)
+        notices = query.order_by(NoticeOfAdmission.generated_at.desc()).all()
+
+        if not notices:
+            print("  No notices of admission found.")
+            return
+
+        print(f"\n  {'ID':<5} {'Generated':<18} {'Patient ID':<12} "
+              f"{'Encounter ID':<14} {'Triggered by'}")
+        print(f"  {'──':<5} {'─────────':<18} {'──────────':<12} "
+              f"{'────────────':<14} {'────────────'}")
+        for n in notices:
+            ts = n.generated_at.strftime("%Y-%m-%d %H:%M")
+            print(f"  {n.id:<5} {ts:<18} {n.patient_id:<12} "
+                  f"{n.encounter_id:<14} {n.triggered_by}")
+
+
+def action_export_noa_fhir(notice_id: int):
+    """Serialise a single NoticeOfAdmission as a FHIR Communication JSON file."""
+    with get_session() as session:
+        notice = session.get(NoticeOfAdmission, notice_id)
+        if not notice:
+            print(f"  ✗  No notice found with ID {notice_id}.")
+            return
+
+        resource = noa_to_fhir(notice)
+        output   = bundle_to_json(resource)
+
+        filename = f"noa_{notice.id}.json"
+        with open(filename, "w") as f:
+            f.write(output)
+
+        print(f"\n  FHIR Communication resource written to: {filename}")
+        print(f"\n  Preview (first 30 lines):\n")
+        for i, line in enumerate(output.splitlines()):
+            if i >= 30:
+                print("  ... (truncated — open the file to see the rest)")
+                break
+            print(f"  {line}")
+
+
+def action_list_noa_rules():
+    """Print all NOA trigger rules."""
+    with get_session() as session:
+        rules = session.query(NoaRule).order_by(NoaRule.id).all()
+        if not rules:
+            print("  No NOA rules configured — no notices will be auto-generated.")
+            return
+        print(f"\n  {'ID':<5} {'Class code':<12} {'Status':<16} {'Created'}")
+        print(f"  {'──':<5} {'──────────':<12} {'──────':<16} {'───────'}")
+        for r in rules:
+            ts = r.created_at.strftime("%Y-%m-%d %H:%M")
+            print(f"  {r.id:<5} {r.class_code or '(any)':<12} "
+                  f"{r.status or '(any)':<16} {ts}")
+
+
+def action_add_noa_rule(class_code: "str | None", status: "str | None"):
+    """Persist a new NOA trigger rule."""
+    with get_session() as session:
+        rule = NoaRule(class_code=class_code or None, status=status or None)
+        session.add(rule)
+        session.commit()
+        code_str   = class_code or "(any)"
+        status_str = status     or "(any)"
+        print(f"\n  NOA rule added  (id={rule.id}  "
+              f"class={code_str}  status={status_str})")
+
+
+def action_delete_noa_rule(rule_id: int):
+    """Remove a NOA trigger rule by ID."""
+    with get_session() as session:
+        rule = session.get(NoaRule, rule_id)
+        if not rule:
+            print(f"  ✗  No NOA rule found with ID {rule_id}.")
+            return
+        session.delete(rule)
+        session.commit()
+        print(f"  NOA rule #{rule_id} removed.")
 
 
 # ---------------------------------------------------------------------------

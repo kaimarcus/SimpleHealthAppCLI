@@ -6,12 +6,14 @@ SQLAlchemy setup and ORM models for our simple FHIR-backed health app.
 We use SQLite so there's nothing to install or configure — the DB file
 (health.db) is created automatically in the current directory.
 
-Four tables mirror the FHIR resource types we support:
+Tables:
   - patients              ↔  FHIR Patient
   - observations          ↔  FHIR Observation
   - providers             ↔  FHIR Practitioner
   - encounters            ↔  FHIR Encounter
   - encounter_participants   (join: Encounter ↔ Provider with a role)
+  - noa_rules             —  configurable criteria that trigger a Notice of Admission
+  - notices_of_admission  ↔  FHIR Communication (Notice of Admission)
 """
 
 from datetime import date, datetime
@@ -212,6 +214,58 @@ class EncounterHistory(Base):
         return (f"<EncounterHistory history_id={self.history_id} "
                 f"encounter_id={self.encounter_id} version={self.version} "
                 f"changed_at={self.changed_at}>")
+
+
+class NoaRule(Base):
+    """
+    A single trigger rule for auto-generating a Notice of Admission.
+
+    When an encounter is created, all active rules are evaluated.  A rule
+    matches when every non-null criterion matches the encounter (AND logic).
+    If *any* rule matches (OR logic across rows), a NoticeOfAdmission is
+    generated automatically.
+
+    Leaving both class_code and status as NULL creates a catch-all rule that
+    triggers a notice for every encounter.
+
+    class_code:  HL7 v3 ActCode (AMB, IMP, EMER, OBSENC) or NULL for any class.
+    status:      FHIR Encounter.status or NULL for any status.
+    """
+    __tablename__ = "noa_rules"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    class_code = Column(String(10),  nullable=True)
+    status     = Column(String(30),  nullable=True)
+    created_at = Column(DateTime,    nullable=False, default=datetime.utcnow)
+
+    def __repr__(self):
+        return (f"<NoaRule id={self.id} class_code={self.class_code!r} "
+                f"status={self.status!r}>")
+
+
+class NoticeOfAdmission(Base):
+    """
+    A Notice of Admission (NOA) generated when an encounter matches a NoaRule.
+
+    Maps to a FHIR R4 Communication resource (resourceType='Communication').
+
+    triggered_by:  human-readable description of which rule criteria matched,
+                   e.g. 'class=IMP' or 'class=IMP, status=in-progress'.
+    """
+    __tablename__ = "notices_of_admission"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    encounter_id = Column(Integer, ForeignKey("encounters.id"), nullable=False)
+    patient_id   = Column(Integer, ForeignKey("patients.id"),   nullable=False)
+    generated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    triggered_by = Column(String(200), nullable=False)
+
+    encounter = relationship("Encounter")
+    patient   = relationship("Patient")
+
+    def __repr__(self):
+        return (f"<NoticeOfAdmission id={self.id} encounter_id={self.encounter_id} "
+                f"patient_id={self.patient_id} generated_at={self.generated_at}>")
 
 
 # ---------------------------------------------------------------------------

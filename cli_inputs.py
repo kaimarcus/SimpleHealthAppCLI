@@ -199,6 +199,45 @@ def cli_provider_fields(defaults: "dict | None" = None) -> dict:
     }
 
 
+def cli_noa_rule_fields() -> dict:
+    """Prompt for NOA rule trigger criteria.
+
+    The user picks an encounter class (or 'any') and a status (or 'any').
+    A rule with both fields set to None acts as a catch-all.
+
+    Returns dict {class_code, status} where None means 'match any value'.
+    """
+    print("\n  Encounter class to trigger notice on:")
+    print("    0.  (match any class)")
+    for key, (code, display) in KNOWN_ENCOUNTER_CLASSES.items():
+        print(f"    {key}.  {display}  [{code}]")
+
+    valid_class_keys = {"0"} | set(KNOWN_ENCOUNTER_CLASSES.keys())
+    class_key = prompt_until(
+        "Choice",
+        lambda v: v if v in valid_class_keys else None,
+        f"Enter 0 for any class, or 1–{len(KNOWN_ENCOUNTER_CLASSES)}.",
+        default="0",
+    )
+    class_code = KNOWN_ENCOUNTER_CLASSES[class_key][0] if class_key != "0" else None
+
+    print("\n  Status to trigger notice on:")
+    print("    0.  (match any status)")
+    for key, status_val in KNOWN_STATUSES.items():
+        print(f"    {key}.  {status_val}")
+
+    valid_status_keys = {"0"} | set(KNOWN_STATUSES.keys())
+    status_key = prompt_until(
+        "Choice",
+        lambda v: v if v in valid_status_keys else None,
+        f"Enter 0 for any status, or 1–{len(KNOWN_STATUSES)}.",
+        default="0",
+    )
+    status = KNOWN_STATUSES[status_key] if status_key != "0" else None
+
+    return {"class_code": class_code, "status": status}
+
+
 def cli_fhir_import() -> str:
     """Prompt for a FHIR Patient JSON string.
 

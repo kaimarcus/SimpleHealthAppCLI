@@ -28,6 +28,7 @@ from cli_inputs import (
     cli_encounter_fields,
     cli_provider_fields,
     cli_fhir_import,
+    cli_noa_rule_fields,
 )
 from actions import (
     action_save_patient,
@@ -46,6 +47,12 @@ from actions import (
     action_list_providers,
     action_export_fhir_bundle,
     action_import_fhir_patient,
+    action_check_and_create_noa,
+    action_list_notices,
+    action_export_noa_fhir,
+    action_list_noa_rules,
+    action_add_noa_rule,
+    action_delete_noa_rule,
     action_seed_demo_data,
 )
 
@@ -222,6 +229,7 @@ def do_add_encounter():
                 _manage_encounter_providers(session, encounter)
             session.commit()
             print(f"\n  Encounter #{encounter.id} saved.")
+        action_check_and_create_noa(encounter)
     except QuitRequested:
         print("  Cancelled — encounter not saved.")
 
@@ -353,6 +361,64 @@ def do_import_fhir_patient():
 
 
 # ---------------------------------------------------------------------------
+# Notice of Admission operations
+# ---------------------------------------------------------------------------
+
+def do_list_notices():
+    header("Notices of Admission")
+    raw = prompt("Filter by patient ID (leave blank for all)", required=False)
+    patient_id = None
+    if raw:
+        try:
+            patient_id = int(raw)
+        except ValueError:
+            print("  ✗  Patient ID must be a number — showing all notices.")
+    action_list_notices(patient_id=patient_id)
+
+
+def do_export_noa_fhir():
+    header("Export Notice of Admission — FHIR")
+    try:
+        action_list_notices()
+        notice_id = prompt_until(
+            "Notice ID to export",
+            lambda v: int(v) if v.isdigit() else None,
+            "Enter a valid numeric notice ID.",
+        )
+        action_export_noa_fhir(notice_id)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+def do_list_noa_rules():
+    header("NOA Rules")
+    action_list_noa_rules()
+
+
+def do_add_noa_rule():
+    header("Add NOA Rule")
+    try:
+        data = cli_noa_rule_fields()
+        action_add_noa_rule(data["class_code"], data["status"])
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+def do_remove_noa_rule():
+    header("Remove NOA Rule")
+    try:
+        action_list_noa_rules()
+        rule_id = prompt_until(
+            "Rule ID to remove",
+            lambda v: int(v) if v.isdigit() else None,
+            "Enter a valid numeric rule ID.",
+        )
+        action_delete_noa_rule(rule_id)
+    except QuitRequested:
+        print("  Cancelled.")
+
+
+# ---------------------------------------------------------------------------
 # Seed demo data
 # ---------------------------------------------------------------------------
 
@@ -436,6 +502,22 @@ def menu_fhir():
     })
 
 
+def menu_noa_rules():
+    _submenu("Configure NOA Rules", {
+        "1": ("List rules",   do_list_noa_rules),
+        "2": ("Add rule",     do_add_noa_rule),
+        "3": ("Remove rule",  do_remove_noa_rule),
+    })
+
+
+def menu_notices():
+    _submenu("Notices of Admission", {
+        "1": ("View notices",          do_list_notices),
+        "2": ("Export notice as FHIR", do_export_noa_fhir),
+        "3": ("Configure rules",       menu_noa_rules),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
@@ -449,8 +531,9 @@ MAIN_MENU = """
   │  2.  Observations                            │
   │  3.  Encounters                              │
   │  4.  Providers                               │
-  │  5.  FHIR                                    │
-  │  6.  Seed Demo Data                          │
+  │  5.  Notices of Admission                    │
+  │  6.  FHIR                                    │
+  │  7.  Seed Demo Data                          │
   │  0.  Exit                                    │
   └──────────────────────────────────────────────┘"""
 
@@ -459,8 +542,9 @@ MAIN_ACTIONS = {
     "2": menu_observations,
     "3": menu_encounters,
     "4": menu_providers,
-    "5": menu_fhir,
-    "6": do_seed_demo_data,
+    "5": menu_notices,
+    "6": menu_fhir,
+    "7": do_seed_demo_data,
 }
 
 
@@ -481,7 +565,7 @@ def main():
                 MAIN_ACTIONS[choice]()
             except Exception as e:
                 print(f"\n  ✗  Unexpected error: {e}")
-            if choice == "6":
+            if choice == "7":
                 pause()
         else:
             print("  ✗  Invalid choice.")

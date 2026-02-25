@@ -17,10 +17,11 @@ Key FHIR concepts shown here:
   - Bundle           : container that groups multiple resources together
 
 FHIR resource types implemented here:
-  - Patient        ↔  SQL Patient
-  - Observation    ↔  SQL Observation
-  - Practitioner   ↔  SQL Provider
-  - Encounter      ↔  SQL Encounter  (with EncounterParticipant links)
+  - Patient               ↔  SQL Patient
+  - Observation           ↔  SQL Observation
+  - Practitioner          ↔  SQL Provider
+  - Encounter             ↔  SQL Encounter  (with EncounterParticipant links)
+  - Communication (NOA)   ↔  SQL NoticeOfAdmission
 """
 
 import json
@@ -28,7 +29,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from database import Patient, Observation, Provider, Encounter
+    from database import Patient, Observation, Provider, Encounter, NoticeOfAdmission
 
 # LOINC is the standard coding system for clinical observations.
 LOINC_SYSTEM = "http://loinc.org"
@@ -38,6 +39,11 @@ UCUM_SYSTEM  = "http://unitsofmeasure.org"
 V3_ACT_CODE_SYSTEM = "http://terminology.hl7.org/CodeSystem/v3-ActCode"
 # v3 ParticipationType codes (ATND = attender, CON = consultant, REF = referrer, …).
 V3_PARTICIPATION_SYSTEM = "http://terminology.hl7.org/CodeSystem/v3-ParticipationType"
+
+# HL7 communication-category coding system (used for Notice of Admission).
+COMMUNICATION_CATEGORY_SYSTEM = (
+    "http://terminology.hl7.org/CodeSystem/communication-category"
+)
 
 # Map our human-readable role names to the standard v3 participation codes.
 ROLE_TO_V3_CODE = {
@@ -387,3 +393,67 @@ def build_patient_bundle(patient: "Patient") -> dict:
 def bundle_to_json(bundle: dict, indent: int = 2) -> str:
     """Serialise a Bundle dict to a pretty-printed JSON string."""
     return json.dumps(bundle, indent=indent, default=str)
+
+
+# ---------------------------------------------------------------------------
+# NoticeOfAdmission  ↔  FHIR Communication
+# ---------------------------------------------------------------------------
+
+def noa_to_fhir(notice: "NoticeOfAdmission") -> dict:
+    """
+    Convert a SQL NoticeOfAdmission row into a FHIR R4 Communication resource.
+
+    The Communication resource is the standard FHIR mechanism for representing
+    a notice or message exchanged in the context of care.  A Notice of
+    Admission is modelled as a completed notification Communication linked to
+    the triggering Encounter and the Patient.
+
+    FHIR Communication structure:
+    {
+      "resourceType": "Communication",
+      "id": "1",
+      "status": "completed",           ← registered|in-progress|completed|…
+      "category": [{                   ← kind of communication (CodeableConcept)
+        "coding": [{
+          "system": "http://terminology.hl7.org/CodeSystem/communication-category",
+          "code": "notification",
+          "display": "Notification"
+        }],
+        "text": "Notice of Admission"
+      }],
+      "subject": { "reference": "Patient/42" },    ← who the notice is about
+      "encounter": { "reference": "Encounter/3" },  ← the triggering encounter
+      "sent": "2026-02-22T10:00:00+00:00",         ← when the notice was generated
+      "payload": [{                                  ← content of the notice
+        "contentString": "Notice of Admission. Triggered by rule: class=IMP."
+      }]
+    }
+    """
+    return {
+        "resourceType": "Communication",
+        "id": str(notice.id),
+        "status": "completed",
+        "category": [
+            {
+                "coding": [
+                    {
+                        "system":  COMMUNICATION_CATEGORY_SYSTEM,
+                        "code":    "notification",
+                        "display": "Notification",
+                    }
+                ],
+                "text": "Notice of Admission",
+            }
+        ],
+        "subject":   {"reference": f"Patient/{notice.patient_id}"},
+        "encounter": {"reference": f"Encounter/{notice.encounter_id}"},
+        "sent": notice.generated_at.replace(tzinfo=timezone.utc).isoformat(),
+        "payload": [
+            {
+                "contentString": (
+                    f"Notice of Admission. "
+                    f"Triggered by rule: {notice.triggered_by}."
+                )
+            }
+        ],
+    }
